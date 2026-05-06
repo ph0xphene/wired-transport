@@ -5,7 +5,7 @@ use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{
     Blob, BlobPropertyBag, DragEvent, Event, File, HtmlAnchorElement, HtmlInputElement, Url,
 };
-use wired_core::{Decoder, Encoder, StegoConfig};
+use wired_core::{stress_test, Decoder, Encoder, SignalReport, StegoConfig};
 
 #[component]
 pub fn App() -> impl IntoView {
@@ -15,6 +15,9 @@ pub fn App() -> impl IntoView {
     let (key, set_key) = create_signal(String::from("change-me"));
     let (status, set_status) = create_signal(String::from("awaiting carrier image"));
     let (decoded, set_decoded) = create_signal(String::new());
+    let (signal, set_signal) = create_signal(String::from(
+        "[SIGNAL] Average Correlation Peak: --\n[DEBUG] Raw BER: --\n[DEBUG] PSNR: --",
+    ));
     let (download_url, set_download_url) = create_signal::<Option<String>>(None);
     let (download_name, set_download_name) = create_signal(String::from("wired-carrier.png"));
 
@@ -87,11 +90,43 @@ pub fn App() -> impl IntoView {
 
         set_status.set(String::from("extracting payload"));
         match decode_carrier(&bytes, key.as_bytes()) {
-            Ok(data) => {
-                set_decoded.set(String::from_utf8_lossy(&data).to_string());
-                set_status.set(format!("decoded {} bytes", data.len()));
+            Ok(extracted) => {
+                set_decoded.set(String::from_utf8_lossy(&extracted.data).to_string());
+                set_signal.set(format_signal(&extracted.signal));
+                set_status.set(format!("decoded {} bytes", extracted.data.len()));
             }
             Err(err) => set_status.set(format!("decode failed: {err}")),
+        }
+    };
+
+    let stress = move |_| {
+        let Some(bytes) = cover_bytes.get_untracked() else {
+            set_status.set(String::from("load a PNG or JPEG carrier first"));
+            return;
+        };
+        let payload = payload.get_untracked();
+        let key = key.get_untracked();
+
+        set_status.set(String::from("running DSSS stress test at JPEG quality 50"));
+        match stress_test_carrier(&bytes, payload.as_bytes(), key.as_bytes(), 50) {
+            Ok(report) => match download_url_for(
+                &report.attacked.bytes,
+                report.attacked.container.mime_type(),
+            ) {
+                Ok(url) => {
+                    set_download_name.set(String::from("wired-stress-q50.jpg"));
+                    set_download_url.set(Some(url));
+                    set_decoded.set(String::from_utf8_lossy(&report.decoded).to_string());
+                    set_signal.set(format_signal(&report.signal));
+                    set_status.set(if report.success {
+                        String::from("stress test recovered payload after JPEG quality 50")
+                    } else {
+                        String::from("stress test failed to recover payload")
+                    });
+                }
+                Err(err) => set_status.set(format!("stress download URL failed: {err:?}")),
+            },
+            Err(err) => set_status.set(format!("stress test failed: {err}")),
         }
     };
 
@@ -139,6 +174,7 @@ pub fn App() -> impl IntoView {
                     <div class="buttons">
                         <button on:click=encode>"inject"</button>
                         <button class="secondary" on:click=decode>"extract"</button>
+                        <button class="secondary" on:click=stress>"stress test"</button>
                     </div>
                     <Show when=move || download_url.get().is_some()>
                         <a class="download" href=move || download_url.get().unwrap_or_default() download=move || download_name.get()>
@@ -150,6 +186,7 @@ pub fn App() -> impl IntoView {
                 <div class="panel output">
                     <div class="panel-title">"terminal/output"</div>
                     <pre class="status">{move || format!("> {status}", status = status.get())}</pre>
+                    <pre class="status">{move || signal.get()}</pre>
                     <pre class="decoded">{move || decoded.get()}</pre>
                 </div>
             </section>
@@ -182,8 +219,49 @@ fn encode_carrier(
     .map_err(|err| err.to_string())
 }
 
-fn decode_carrier(input: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
-    Decoder::extract_bytes(input, key).map_err(|err| err.to_string())
+fn decode_carrier(input: &[u8], key: &[u8]) -> Result<wired_core::ExtractedData, String> {
+    Decoder::extract_bytes_with_report(input, key).map_err(|err| err.to_string())
+}
+
+fn stress_test_carrier(
+    input: &[u8],
+    payload: &[u8],
+    key: &[u8],
+    quality: u8,
+) -> Result<wired_core::StressTestReport, String> {
+    stress_test(
+        input,
+        payload,
+        key,
+        quality,
+        StegoConfig {
+            recovery_rate: 0.25,
+            bit_repetition: 16,
+        },
+    )
+    .map_err(|err| err.to_string())
+}
+
+fn format_signal(signal: &SignalReport) -> String {
+    let ber = signal
+        .raw_ber
+        .map(|value| format!("{:.2}%", value * 100.0))
+        .unwrap_or_else(|| String::from("--"));
+    let psnr = signal
+        .psnr_db
+        .map(|value| {
+            if value.is_infinite() {
+                String::from("inf dB")
+            } else {
+                format!("{value:.1} dB")
+            }
+        })
+        .unwrap_or_else(|| String::from("--"));
+
+    format!(
+        "[SIGNAL] Average Correlation Peak: {:.1}\n[DEBUG] Raw BER: {ber}\n[DEBUG] PSNR: {psnr}",
+        signal.average_correlation_peak
+    )
 }
 
 fn download_url_for(bytes: &[u8], mime_type: &str) -> Result<String, wasm_bindgen::JsValue> {

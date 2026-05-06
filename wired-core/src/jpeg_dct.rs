@@ -1,17 +1,20 @@
 use image::{DynamicImage, RgbImage};
 
-use crate::crypto;
+use crate::dsss::{DsssConfig, SignalReport};
 use crate::stego_engine::{
     bits_to_bytes, build_header, bytes_to_bits, decode_payload, encode_payload, mapping_indices,
-    parse_header, reserved_mask, StegoConfig, StegoError, HEADER_LEN, HEADER_REPEAT,
+    parse_header, reserved_mask, StegoConfig, StegoError, HEADER_LEN, MAX_PAYLOAD_REPEAT,
     PUBLIC_HEADER_SEED,
 };
+use crate::{crypto, dsss};
 
 const BLOCK: usize = 8;
 const JPEG_RECOVERY_QUALITY: u8 = 75;
 const MID_ZIGZAG_START: usize = 5;
-const MID_ZIGZAG_END: usize = 45;
-const COEFF_SIGN_STRENGTH: i32 = 10;
+const MID_ZIGZAG_END: usize = 50;
+const HEADER_CHIPS_PER_SYMBOL: usize = 32;
+const MIN_PAYLOAD_CHIPS_PER_SYMBOL: usize = 16;
+const DSSS_GAIN: i32 = 2;
 
 const LUMA_Q50: [u8; 64] = [
     16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56,
@@ -31,56 +34,95 @@ pub fn inject_with_config(
     key: &[u8],
     config: StegoConfig,
 ) -> Result<DynamicImage, StegoError> {
+    Ok(inject_with_report(image, data, key, config)?.image)
+}
+
+pub fn inject_with_report(
+    image: DynamicImage,
+    data: &[u8],
+    key: &[u8],
+    config: StegoConfig,
+) -> Result<JpegInjectReport, StegoError> {
     let (ecc_packet, salt, nonce, bit_repetition) = encode_payload(data, key, config)?;
+    let payload_chips = bit_repetition
+        .max(MIN_PAYLOAD_CHIPS_PER_SYMBOL)
+        .min(MAX_PAYLOAD_REPEAT);
     let header = build_header(
         ecc_packet.len() as u64,
-        bit_repetition as u8,
+        payload_chips as u8,
         config.recovery_rate,
         &salt,
         &nonce,
     );
 
-    let mut rgb = image.to_rgb8();
+    let original_rgb = image.to_rgb8();
+    let mut rgb = original_rgb.clone();
     let layout = Layout::new(rgb.width() as usize, rgb.height() as usize)?;
     let capacity = layout.capacity();
-    let header_slots = HEADER_LEN * 8 * HEADER_REPEAT;
-    let payload_slots = ecc_packet.len() * 8 * bit_repetition;
+    let header_bits = bytes_to_bits(&header);
+    let payload_bits = bytes_to_bits(&ecc_packet);
+    let header_slots = header_bits.len() * HEADER_CHIPS_PER_SYMBOL;
+    let payload_slots = payload_bits.len() * payload_chips;
     if header_slots + payload_slots > capacity {
         return Err(StegoError::Capacity);
     }
 
     let quant = luminance_quant_table(JPEG_RECOVERY_QUALITY);
     let mut coeffs = quantized_luma_coefficients(&rgb, &layout, &quant);
+    let original_coeffs = coeffs.clone();
 
     let header_indices = mapping_indices(capacity, header_slots, PUBLIC_HEADER_SEED, None)?;
-    write_repeated_coeff_bits(
+    dsss::spread_bits(
         &mut coeffs,
-        &layout,
+        coeff_positions(),
         &header_indices,
-        &bytes_to_bits(&header),
-        HEADER_REPEAT,
+        &header_bits,
+        dsss_seed(PUBLIC_HEADER_SEED, b"header-pn"),
+        DsssConfig {
+            chips_per_symbol: HEADER_CHIPS_PER_SYMBOL,
+            gain: DSSS_GAIN,
+            threshold: 0.0,
+        },
     );
 
     let reserved = reserved_mask(capacity, &header_indices);
     let payload_seed = crypto::mapping_seed(key, &salt);
     let payload_indices = mapping_indices(capacity, payload_slots, payload_seed, Some(&reserved))?;
-    write_repeated_coeff_bits(
+    dsss::spread_bits(
         &mut coeffs,
-        &layout,
+        coeff_positions(),
         &payload_indices,
-        &bytes_to_bits(&ecc_packet),
-        bit_repetition,
+        &payload_bits,
+        dsss_seed(payload_seed, b"payload-pn"),
+        DsssConfig {
+            chips_per_symbol: payload_chips,
+            gain: DSSS_GAIN,
+            threshold: 0.0,
+        },
     );
 
-    apply_coefficients_to_luma(&mut rgb, &layout, &coeffs, &quant);
-    Ok(DynamicImage::ImageRgb8(rgb))
+    apply_coefficients_to_luma(&mut rgb, &layout, &original_coeffs, &coeffs, &quant);
+    let psnr_db = dsss::psnr_rgb(&original_rgb, &rgb);
+    Ok(JpegInjectReport {
+        image: DynamicImage::ImageRgb8(rgb),
+        packet_bits: payload_bits,
+        psnr_db,
+    })
 }
 
 pub fn extract(image: DynamicImage, key: &[u8]) -> Result<Vec<u8>, StegoError> {
+    Ok(extract_with_report(image, key)?.data)
+}
+
+pub fn extract_with_report(
+    image: DynamicImage,
+    key: &[u8],
+) -> Result<JpegExtractReport, StegoError> {
     let rgb = image.to_rgb8();
     let layout = Layout::new(rgb.width() as usize, rgb.height() as usize)?;
     let capacity = layout.capacity();
-    let header_slots = HEADER_LEN * 8 * HEADER_REPEAT;
+    let header_bit_count = HEADER_LEN * 8;
+    let header_slots = header_bit_count * HEADER_CHIPS_PER_SYMBOL;
     if header_slots > capacity {
         return Err(StegoError::Capacity);
     }
@@ -88,17 +130,23 @@ pub fn extract(image: DynamicImage, key: &[u8]) -> Result<Vec<u8>, StegoError> {
     let quant = luminance_quant_table(JPEG_RECOVERY_QUALITY);
     let coeffs = quantized_luma_coefficients(&rgb, &layout, &quant);
     let header_indices = mapping_indices(capacity, header_slots, PUBLIC_HEADER_SEED, None)?;
-    let header_bits = read_repeated_coeff_bits(
+    let header_readout = dsss::correlate_bits(
         &coeffs,
-        &layout,
+        coeff_positions(),
         &header_indices,
-        HEADER_LEN * 8,
-        HEADER_REPEAT,
+        header_bit_count,
+        dsss_seed(PUBLIC_HEADER_SEED, b"header-pn"),
+        DsssConfig {
+            chips_per_symbol: HEADER_CHIPS_PER_SYMBOL,
+            gain: DSSS_GAIN,
+            threshold: 0.0,
+        },
     );
-    let header = bits_to_bytes(&header_bits);
+    let header = bits_to_bytes(&header_readout.bits);
     let parsed = parse_header(&header)?;
 
-    let payload_slots = parsed.packet_len * 8 * parsed.bit_repetition;
+    let payload_bit_count = parsed.packet_len * 8;
+    let payload_slots = payload_bit_count * parsed.bit_repetition;
     if header_slots + payload_slots > capacity {
         return Err(StegoError::Capacity);
     }
@@ -106,16 +154,42 @@ pub fn extract(image: DynamicImage, key: &[u8]) -> Result<Vec<u8>, StegoError> {
     let reserved = reserved_mask(capacity, &header_indices);
     let payload_seed = crypto::mapping_seed(key, &parsed.salt);
     let payload_indices = mapping_indices(capacity, payload_slots, payload_seed, Some(&reserved))?;
-    let payload_bits = read_repeated_coeff_bits(
+    let payload_readout = dsss::correlate_bits(
         &coeffs,
-        &layout,
+        coeff_positions(),
         &payload_indices,
-        parsed.packet_len * 8,
-        parsed.bit_repetition,
+        payload_bit_count,
+        dsss_seed(payload_seed, b"payload-pn"),
+        DsssConfig {
+            chips_per_symbol: parsed.bit_repetition,
+            gain: DSSS_GAIN,
+            threshold: 0.0,
+        },
     );
-    let packet = bits_to_bytes(&payload_bits);
+    let packet = bits_to_bytes(&payload_readout.bits);
 
-    decode_payload(&packet, key, &parsed.salt, &parsed.nonce)
+    let data = decode_payload(&packet, key, &parsed.salt, &parsed.nonce)?;
+    let metrics = dsss::signal_report(&payload_readout.correlations, None, None);
+
+    Ok(JpegExtractReport {
+        data,
+        packet_bits: payload_readout.bits,
+        metrics,
+    })
+}
+
+#[derive(Debug)]
+pub struct JpegInjectReport {
+    pub image: DynamicImage,
+    pub packet_bits: Vec<u8>,
+    pub psnr_db: Option<f32>,
+}
+
+#[derive(Debug)]
+pub struct JpegExtractReport {
+    pub data: Vec<u8>,
+    pub packet_bits: Vec<u8>,
+    pub metrics: SignalReport,
 }
 
 struct Layout {
@@ -171,78 +245,33 @@ fn quantized_luma_coefficients(
     coeffs
 }
 
-fn write_repeated_coeff_bits(
-    coeffs: &mut [[i32; 64]],
-    layout: &Layout,
-    indices: &[usize],
-    bits: &[u8],
-    repeat: usize,
-) {
-    for (bit_idx, bit) in bits.iter().enumerate() {
-        for copy in 0..repeat {
-            write_coeff_bit(coeffs, layout, indices[bit_idx * repeat + copy], *bit);
-        }
-    }
-}
-
-fn read_repeated_coeff_bits(
-    coeffs: &[[i32; 64]],
-    layout: &Layout,
-    indices: &[usize],
-    bit_count: usize,
-    repeat: usize,
-) -> Vec<u8> {
-    let mut bits = Vec::with_capacity(bit_count);
-    for bit_idx in 0..bit_count {
-        let mut ones = 0usize;
-        for copy in 0..repeat {
-            ones += read_coeff_bit(coeffs, layout, indices[bit_idx * repeat + copy]) as usize;
-        }
-        bits.push((ones * 2 >= repeat) as u8);
-    }
-    bits
-}
-
-fn write_coeff_bit(coeffs: &mut [[i32; 64]], layout: &Layout, index: usize, bit: u8) {
-    let (block_idx, coeff_idx) = slot_to_coeff(layout, index);
-    let coeff = &mut coeffs[block_idx][coeff_idx];
-    let magnitude = coeff.abs().max(COEFF_SIGN_STRENGTH);
-    *coeff = if bit == 0 { -magnitude } else { magnitude };
-}
-
-fn read_coeff_bit(coeffs: &[[i32; 64]], layout: &Layout, index: usize) -> u8 {
-    let (block_idx, coeff_idx) = slot_to_coeff(layout, index);
-    (coeffs[block_idx][coeff_idx] >= 0) as u8
-}
-
-fn slot_to_coeff(_layout: &Layout, index: usize) -> (usize, usize) {
-    let positions = coeff_positions();
-    let block_idx = index / positions.len();
-    let coeff_idx = positions[index % positions.len()];
-    (block_idx, coeff_idx)
-}
-
 fn apply_coefficients_to_luma(
     image: &mut RgbImage,
     layout: &Layout,
-    coeffs: &[[i32; 64]],
+    original_coeffs: &[[i32; 64]],
+    modified_coeffs: &[[i32; 64]],
     quant: &[f32; 64],
 ) {
     for block_y in 0..layout.block_rows {
         for block_x in 0..layout.block_cols {
             let block_idx = block_y * layout.block_cols + block_x;
-            let mut dequantized = [0f32; 64];
+            let mut original_dequantized = [0f32; 64];
+            let mut modified_dequantized = [0f32; 64];
             for idx in 0..64 {
-                dequantized[idx] = coeffs[block_idx][idx] as f32 * quant[idx];
+                original_dequantized[idx] = original_coeffs[block_idx][idx] as f32 * quant[idx];
+                modified_dequantized[idx] = modified_coeffs[block_idx][idx] as f32 * quant[idx];
             }
-            let reconstructed = idct(&dequantized);
+            let original = idct(&original_dequantized);
+            let modified = idct(&modified_dequantized);
 
             for y in 0..BLOCK {
                 for x in 0..BLOCK {
                     let px = (block_x * BLOCK + x) as u32;
                     let py = (block_y * BLOCK + y) as u32;
                     let pixel = image.get_pixel_mut(px, py);
-                    let new_y = (reconstructed[y * BLOCK + x] + 128.0).clamp(0.0, 255.0);
+                    let old_y = rgb_to_luma(pixel.0) as f32;
+                    let delta = modified[y * BLOCK + x] - original[y * BLOCK + x];
+                    let new_y = (old_y + delta).clamp(0.0, 255.0);
                     pixel.0 = replace_luma(pixel.0, new_y);
                 }
             }
@@ -347,6 +376,13 @@ fn luminance_quant_table(quality: u8) -> [f32; 64] {
     out
 }
 
+fn dsss_seed(mut seed: [u8; 32], domain: &[u8]) -> [u8; 32] {
+    for (idx, byte) in seed.iter_mut().enumerate() {
+        *byte ^= domain[idx % domain.len()].wrapping_add(idx as u8);
+    }
+    seed
+}
+
 #[cfg(test)]
 mod tests {
     use image::codecs::jpeg::JpegEncoder;
@@ -355,7 +391,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn jpeg_dct_survives_quality_75_round_trip() {
+    fn jpeg_dsss_survives_quality_50_round_trip() {
         let carrier = DynamicImage::ImageRgb8(ImageBuffer::from_fn(512, 512, |x, y| {
             let base = 96 + ((x + y) % 64) as u8;
             Rgb([
@@ -369,7 +405,7 @@ mod tests {
 
         let encoded = inject_with_config(carrier, payload, key, StegoConfig::default()).unwrap();
         assert_eq!(extract(encoded.clone(), key).unwrap(), payload);
-        let recompressed = recompress_jpeg(&encoded, 75);
+        let recompressed = recompress_jpeg(&encoded, 50);
         let decoded_image =
             image::load_from_memory_with_format(&recompressed, ImageFormat::Jpeg).unwrap();
         let decoded = extract(decoded_image, key).unwrap();

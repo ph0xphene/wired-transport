@@ -6,7 +6,8 @@ use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256StarStar;
 use thiserror::Error;
 
-use crate::{crypto, ecc, jpeg_dct};
+use crate::dsss::SignalReport;
+use crate::{crypto, dsss, ecc, jpeg_dct};
 
 pub(crate) const MAGIC: &[u8; 4] = b"WTR1";
 pub(crate) const VERSION: u8 = 1;
@@ -56,6 +57,20 @@ impl ImageContainer {
 pub struct EncodedImage {
     pub bytes: Vec<u8>,
     pub container: ImageContainer,
+}
+
+#[derive(Debug)]
+pub struct ExtractedData {
+    pub data: Vec<u8>,
+    pub signal: SignalReport,
+}
+
+#[derive(Debug)]
+pub struct StressTestReport {
+    pub attacked: EncodedImage,
+    pub decoded: Vec<u8>,
+    pub success: bool,
+    pub signal: SignalReport,
 }
 
 impl Default for StegoConfig {
@@ -182,16 +197,30 @@ pub struct Decoder;
 
 impl Decoder {
     pub fn extract_bytes(input: &[u8], key: &[u8]) -> Result<Vec<u8>, StegoError> {
+        Ok(Self::extract_bytes_with_report(input, key)?.data)
+    }
+
+    pub fn extract_bytes_with_report(
+        input: &[u8],
+        key: &[u8],
+    ) -> Result<ExtractedData, StegoError> {
         match detect_container(input)? {
             ImageContainer::Png => {
                 let image = image::load_from_memory_with_format(input, ImageFormat::Png)
                     .map_err(|err| StegoError::Image(err.to_string()))?;
-                Self::extract(image, key)
+                Ok(ExtractedData {
+                    data: Self::extract(image, key)?,
+                    signal: SignalReport::default(),
+                })
             }
             ImageContainer::Jpeg => {
                 let image = image::load_from_memory_with_format(input, ImageFormat::Jpeg)
                     .map_err(|err| StegoError::Image(err.to_string()))?;
-                jpeg_dct::extract(image, key)
+                let report = jpeg_dct::extract_with_report(image, key)?;
+                Ok(ExtractedData {
+                    data: report.data,
+                    signal: report.metrics,
+                })
             }
         }
     }
@@ -459,9 +488,48 @@ fn encode_jpeg(image: &DynamicImage, quality: u8) -> Result<Vec<u8>, StegoError>
     Ok(out)
 }
 
+pub fn simulate_attack(input: &[u8], quality: u8) -> Result<EncodedImage, StegoError> {
+    let image = image::load_from_memory(input).map_err(|err| StegoError::Image(err.to_string()))?;
+    Ok(EncodedImage {
+        bytes: encode_jpeg(&image, quality)?,
+        container: ImageContainer::Jpeg,
+    })
+}
+
+pub fn stress_test(
+    input: &[u8],
+    payload: &[u8],
+    key: &[u8],
+    quality: u8,
+    config: StegoConfig,
+) -> Result<StressTestReport, StegoError> {
+    let carrier =
+        image::load_from_memory(input).map_err(|err| StegoError::Image(err.to_string()))?;
+    let injected = jpeg_dct::inject_with_report(carrier, payload, key, config)?;
+    let encoded = encode_jpeg(&injected.image, 92)?;
+    let attacked = simulate_attack(&encoded, quality)?;
+    let attacked_image = image::load_from_memory_with_format(&attacked.bytes, ImageFormat::Jpeg)
+        .map_err(|err| StegoError::Image(err.to_string()))?;
+    let extracted = jpeg_dct::extract_with_report(attacked_image, key)?;
+    let raw_ber = dsss::bit_error_rate(&injected.packet_bits, &extracted.packet_bits);
+    let mut signal = extracted.metrics;
+    signal.raw_ber = raw_ber;
+    signal.psnr_db = injected.psnr_db;
+    let success = extracted.data == payload;
+
+    Ok(StressTestReport {
+        attacked,
+        decoded: extracted.data,
+        success,
+        signal,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use image::codecs::jpeg::JpegEncoder;
     use image::{ImageBuffer, Rgba};
+    use image::{Rgb, RgbImage};
     use rand::seq::SliceRandom;
     use rand::{RngCore, SeedableRng};
 
@@ -511,5 +579,38 @@ mod tests {
 
         let decoded = Decoder::extract(DynamicImage::ImageRgba8(noisy), key).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn stress_test_reports_dsss_metrics_at_quality_50() {
+        let carrier = DynamicImage::ImageRgb8(RgbImage::from_fn(512, 512, |x, y| {
+            let base = 96 + ((x + y) % 64) as u8;
+            Rgb([
+                base,
+                base.saturating_add(((x / 8) % 16) as u8),
+                base.saturating_sub(((y / 8) % 16) as u8),
+            ])
+        }));
+        let mut input = Vec::new();
+        JpegEncoder::new_with_quality(&mut input, 92)
+            .encode_image(&carrier)
+            .unwrap();
+
+        let report = stress_test(
+            &input,
+            b"dsss adversarial payload",
+            b"stress-key",
+            50,
+            StegoConfig {
+                recovery_rate: 0.25,
+                bit_repetition: 16,
+            },
+        )
+        .unwrap();
+
+        assert!(report.success);
+        assert!(report.signal.average_correlation_peak > 1.0);
+        assert!(report.signal.raw_ber.unwrap() < 0.25);
+        assert!(report.signal.psnr_db.unwrap().is_finite());
     }
 }
